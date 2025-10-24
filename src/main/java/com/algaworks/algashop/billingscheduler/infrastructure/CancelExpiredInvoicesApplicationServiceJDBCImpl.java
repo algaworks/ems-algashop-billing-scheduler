@@ -8,6 +8,7 @@ import org.springframework.jdbc.core.JdbcOperations;
 import org.springframework.jdbc.core.PreparedStatementSetter;
 import org.springframework.jdbc.core.RowMapper;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.support.TransactionTemplate;
 
 import java.time.Duration;
 import java.util.List;
@@ -19,8 +20,11 @@ import java.util.UUID;
 public class CancelExpiredInvoicesApplicationServiceJDBCImpl implements CancelExpiredInvoicesApplicationService {
 
     private final JdbcOperations jdbcOperations;
+    private final TransactionTemplate transactionTemplate;
 
     private static final Duration EXPIRED_SINCE = Duration.ofDays(1);
+
+    private static final int BATCH_LIMIT = 5;
 
     private static final String UNPAID_STATUS = "UNPAID";
 
@@ -31,7 +35,10 @@ public class CancelExpiredInvoicesApplicationServiceJDBCImpl implements CancelEx
                 select id
                 from invoice i
                 where i.expires_at <= now() - interval '%d days'
-                  and i.status = ?
+                and i.status = ?
+                limit ?
+                for update
+                skip locked
             """, EXPIRED_SINCE.toDays());
 
     private static final String UPDATE_INVOICE_STATUS_SQL = """
@@ -41,15 +48,19 @@ public class CancelExpiredInvoicesApplicationServiceJDBCImpl implements CancelEx
 
     @Override
     public void cancelExpiredInvoices() {
-        List<UUID> invoiceIds = fetchExpiredInvoices();
-        log.info("Task - Total invoices fetched: {}", invoiceIds.size());
-        int totalCanceledInvoices = cancelInvoices(invoiceIds);
-        log.info("Task - Total invoices canceled: {}", totalCanceledInvoices);
+        transactionTemplate.execute(status -> {
+            List<UUID> invoiceIds = fetchExpiredInvoices();
+            log.info("Task - Total invoices fetched: {}", invoiceIds.size());
+            int totalCanceledInvoices = cancelInvoices(invoiceIds);
+            log.info("Task - Total invoices canceled: {}", totalCanceledInvoices);
+            return true;
+        });
     }
 
     private List<UUID> fetchExpiredInvoices() {
         PreparedStatementSetter preparedStatementSetter = ps -> {
             ps.setString(1, UNPAID_STATUS);
+            ps.setInt(2, BATCH_LIMIT);
         };
         RowMapper<UUID> mapper = (resultSet, rowNum) -> resultSet.getObject("id", UUID.class);
         return jdbcOperations.query(SELECT_EXPIRED_INVOICES_SQL, preparedStatementSetter, mapper);
